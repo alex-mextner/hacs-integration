@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from homeassistant.const import __version__ as HA_VERSION
 
 from homeassistant.helpers.issue_registry import IssueSeverity, async_create_issue
 from homeassistant.loader import async_get_custom_components
@@ -14,6 +18,7 @@ from ..utils.decode import decode_content
 from ..utils.decorator import concurrent
 from ..utils.filters import get_first_directory_in_directory
 from ..utils.json import json_loads
+from ..utils.submodule_update import async_install_managed, is_managed, validate_ui_ref
 from .base import HacsRepository
 
 if TYPE_CHECKING:
@@ -36,6 +41,68 @@ class HacsIntegrationRepository(HacsRepository):
     def localpath(self):
         """Return localpath."""
         return f"{self.hacs.core.config_path}/custom_components/{self.data.domain}"
+
+    async def async_install(self, *, version: str | None = None, **kwargs) -> None:
+        """Complete managed deployment and HACS reconciliation despite client cancellation."""
+        if not self.data.domain:
+            await self.update_repository(force=True)
+        try:
+            managed = await self.hacs.hass.async_add_executor_job(
+                is_managed, Path(self.hacs.core.config_path), self.data.domain
+            )
+        except RuntimeError as exc:
+            raise HacsException(str(exc)) from exc
+        if not managed:
+            return await super().async_install(version=version, **kwargs)
+        transaction = asyncio.create_task(super().async_install(version=version, **kwargs))
+        try:
+            return await asyncio.shield(transaction)
+        except asyncio.CancelledError:
+            try:
+                await transaction
+            except Exception:
+                self.logger.exception("Git-managed update failed while its caller was cancelled")
+            raise
+
+    async def async_install_repository(self, *, version: str | None = None, **kwargs) -> None:
+        """Use Git for explicitly managed integrations, normal HACS for the rest."""
+        root = Path(self.hacs.core.config_path)
+        try:
+            managed = await self.hacs.hass.async_add_executor_job(
+                is_managed, root, self.data.domain
+            )
+            if not managed:
+                return await super().async_install_repository(version=version, **kwargs)
+            force = version is None or version != self.data.last_version
+            await self.update_repository(force=force)
+            selected = version or self.version_to_download()
+            await self.hacs.hass.async_add_executor_job(
+                validate_ui_ref,
+                root,
+                self.data.domain,
+                selected,
+                self.data.default_branch or "main",
+            )
+            self.validate.errors.clear()
+            result = await async_install_managed(
+                root, self.data.domain, self.data.full_name, selected, HA_VERSION
+            )
+        except RuntimeError as exc:
+            raise HacsException(str(exc)) from exc
+        branch_install = selected == self.data.default_branch or result.get(
+            "requested_is_branch", False
+        )
+        self.ref = selected if branch_install else f"tags/{selected}"
+        self.data.installed = True
+        commit_width = len(self.data.last_commit or "0000000") if branch_install else 40
+        self.data.installed_commit = result["commit"][:commit_width]
+        self.data.installed_version = None if branch_install else selected
+        self.logger.info(
+            "%s Git-managed update installed %s (%s)",
+            self.string,
+            result["version"],
+            result["commit"],
+        )
 
     async def async_post_installation(self):
         """Run post installation steps."""
